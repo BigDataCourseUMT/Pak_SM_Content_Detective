@@ -1,9 +1,13 @@
 import os, re
+from pathlib import Path
 from datetime import datetime
 from collections import Counter
+from unittest import result
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+
+px.defaults.template = "plotly_dark"
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -13,15 +17,120 @@ from sklearn.pipeline import Pipeline
 load_dotenv()
 st.set_page_config(page_title="Pakistani Social Media Content Detective", page_icon="🕵️", layout="wide")
 
+
 st.markdown("""
 <style>
-.main {background-color:#f7f9fc}
-[data-testid="stMetric"] {background:white;padding:14px;border-radius:12px;border:1px solid #e7ebf2}
-h1,h2,h3 {color:#12304a}
+/* Consistent dark dashboard background and readable text */
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stHeader"] {
+    background-color: #0e1117 !important;
+    color: #f0f2f6 !important;
+}
+
+/* Sidebar */
+[data-testid="stSidebar"],
+[data-testid="stSidebar"] > div {
+    background-color: #161b22 !important;
+}
+[data-testid="stSidebar"] * {
+    color: #f0f2f6;
+}
+
+/* Top navigation tabs: dark background and visible labels */
+[data-testid="stTabs"] [data-baseweb="tab-list"] {
+    background-color: #161b22 !important;
+    border-bottom: 1px solid #30363d !important;
+    gap: 8px;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] {
+    background-color: #161b22 !important;
+    color: #e6edf3 !important;
+    border-radius: 8px 8px 0 0 !important;
+    padding: 12px 16px !important;
+}
+[data-testid="stTabs"] [data-baseweb="tab"] p,
+[data-testid="stTabs"] [data-baseweb="tab"] div,
+[data-testid="stTabs"] [data-baseweb="tab"] span {
+    color: #e6edf3 !important;
+}
+[data-testid="stTabs"] [aria-selected="true"] {
+    background-color: #252d38 !important;
+    color: #ffffff !important;
+    border-bottom: 3px solid #4f8cff !important;
+}
+[data-testid="stTabs"] [aria-selected="true"] p,
+[data-testid="stTabs"] [aria-selected="true"] div,
+[data-testid="stTabs"] [aria-selected="true"] span {
+    color: #ffffff !important;
+}
+
+/* Metric cards */
+[data-testid="stMetric"] {
+    background-color: #161b22 !important;
+    padding: 18px !important;
+    border-radius: 14px !important;
+    border: 1px solid #30363d !important;
+    box-shadow: 0 3px 12px rgba(0, 0, 0, 0.20);
+    transition: transform 180ms ease, box-shadow 180ms ease;
+}
+[data-testid="stMetric"]:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35);
+}
+[data-testid="stMetricLabel"],
+[data-testid="stMetricLabel"] p,
+[data-testid="stMetricLabel"] label,
+[data-testid="stMetricValue"],
+[data-testid="stMetricValue"] div,
+[data-testid="stMetric"] * {
+    color: #f0f2f6 !important;
+}
+[data-testid="stMetricLabel"] p {
+    font-size: 15px !important;
+    font-weight: 600 !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 32px !important;
+    font-weight: 700 !important;
+}
+
+/* Headings, captions, and regular content */
+h1, h2, h3, h4, p, label, li {
+    color: #f0f2f6;
+}
+[data-testid="stCaptionContainer"],
+[data-testid="stCaptionContainer"] p {
+    color: #b1bac4 !important;
+}
+
+/* Inputs and select boxes */
+[data-baseweb="input"] > div,
+[data-baseweb="select"] > div,
+[data-baseweb="textarea"] > div,
+[data-testid="stTextInput"] input,
+[data-testid="stTextArea"] textarea {
+    background-color: #0e1117 !important;
+    color: #f0f2f6 !important;
+    border-color: #30363d !important;
+}
+input, textarea {
+    color: #f0f2f6 !important;
+}
+
+/* Keep alerts and containers readable in dark mode */
+[data-testid="stAlert"] {
+    border: 1px solid #30363d;
+}
+[data-testid="stDataFrame"],
+[data-testid="stTable"] {
+    border: 1px solid #30363d;
+}
 </style>
 """, unsafe_allow_html=True)
 
-st.title("🕵️ Pakistani Social Media Content Detective")
+
+st.title("Pakistani Social Media Content Detective")
 st.caption("YouTube analytics • Customer sentiment • Clothing content recommendations")
 st.info("Research dashboard for Pakistani clothing brands. Public YouTube data is a sample, not a guarantee of future performance.")
 
@@ -48,16 +157,48 @@ def get_api_key():
         pass
     return key
 
-def fetch_youtube(query, max_videos, max_comments, api_key):
+def fetch_youtube(query, max_videos, max_comments, api_key, fetch_all_comments=False, progress_callback=None):
+    """Collect paginated public YouTube search results, video statistics and comments.
+
+    Search results are paged in batches of up to 50. Comments are collected in
+    batches of up to 100. fetch_all_comments=True follows every available page
+    of top-level comments for each video (subject to API quota and availability).
+    """
     youtube = build("youtube", "v3", developerKey=api_key)
-    search = youtube.search().list(part="snippet", q=query, type="video", regionCode="PK",
-                                   relevanceLanguage="ur", maxResults=max_videos, order="relevance").execute()
-    ids = [x["id"]["videoId"] for x in search.get("items", [])]
+
+    # YouTube search.list returns at most 50 results per request.
+    ids = []
+    seen_ids = set()
+    page_token = None
+    while len(ids) < max_videos:
+        page_size = min(50, max_videos - len(ids))
+        request_args = dict(part="snippet", q=query, type="video", regionCode="PK",
+                            relevanceLanguage="ur", maxResults=page_size, order="relevance")
+        if page_token:
+            request_args["pageToken"] = page_token
+        search = youtube.search().list(**request_args).execute()
+        for item in search.get("items", []):
+            vid = item.get("id", {}).get("videoId")
+            if vid and vid not in seen_ids:
+                seen_ids.add(vid)
+                ids.append(vid)
+                if len(ids) >= max_videos:
+                    break
+        page_token = search.get("nextPageToken")
+        if not page_token or not search.get("items"):
+            break
+
     if not ids:
         return pd.DataFrame(), pd.DataFrame()
-    video_resp = youtube.videos().list(part="snippet,statistics", id=",".join(ids)).execute()
+
+    # videos.list accepts up to 50 video IDs per request.
+    video_items = []
+    for i in range(0, len(ids), 50):
+        video_resp = youtube.videos().list(part="snippet,statistics", id=",".join(ids[i:i+50])).execute()
+        video_items.extend(video_resp.get("items", []))
+
     videos = []
-    for v in video_resp.get("items", []):
+    for v in video_items:
         sn, stt = v.get("snippet", {}), v.get("statistics", {})
         published = pd.to_datetime(sn.get("publishedAt"), utc=True, errors="coerce")
         title = sn.get("title", "")
@@ -65,118 +206,249 @@ def fetch_youtube(query, max_videos, max_comments, api_key):
         tags = sn.get("tags", [])
         hashtags = list(dict.fromkeys(re.findall(r"#([\w]+)", title + " " + desc)))
         videos.append({
-            "video_id": v["id"], "title": title, "channel": sn.get("channelTitle",""),
+            "video_id": v["id"], "title": title, "channel": sn.get("channelTitle", ""),
             "published_at": published, "date": published.date().isoformat() if pd.notna(published) else "",
             "day": published.day_name() if pd.notna(published) else "",
             "hour_utc": int(published.hour) if pd.notna(published) else None,
-            "views": int(stt.get("viewCount",0)), "likes": int(stt.get("likeCount",0)),
-            "comment_count": int(stt.get("commentCount",0)), "hashtags": ", ".join(hashtags),
-            "api_tags": ", ".join(tags), "url": "https://www.youtube.com/watch?v="+v["id"],
+            "views": int(stt.get("viewCount", 0)), "likes": int(stt.get("likeCount", 0)),
+            "comment_count": int(stt.get("commentCount", 0)), "hashtags": ", ".join(hashtags),
+            "api_tags": ", ".join(tags), "url": "https://www.youtube.com/watch?v=" + v["id"],
             "description": desc[:1000]
         })
+
     comments = []
-    for vid in ids:
+    titles_by_id = {v["video_id"]: v["title"] for v in videos}
+    for video_index, vid in enumerate(ids, start=1):
+        page_token = None
+        collected_for_video = 0
         try:
-            resp = youtube.commentThreads().list(part="snippet", videoId=vid, maxResults=min(max_comments,100),
-                                                 order="relevance", textFormat="plainText").execute()
-            title = next((x["title"] for x in videos if x["video_id"] == vid), "")
-            for item in resp.get("items", []):
-                c = item["snippet"]["topLevelComment"]["snippet"]
-                comments.append({"video_id":vid, "video_title":title, "comment":c.get("textDisplay",""),
-                                 "likes":int(c.get("likeCount",0)), "published_at":c.get("publishedAt","")})
+            while fetch_all_comments or collected_for_video < max_comments:
+                remaining = 100 if fetch_all_comments else min(100, max_comments - collected_for_video)
+                if remaining <= 0:
+                    break
+                args = dict(part="snippet", videoId=vid, maxResults=remaining,
+                            order="relevance", textFormat="plainText")
+                if page_token:
+                    args["pageToken"] = page_token
+                resp = youtube.commentThreads().list(**args).execute()
+                items = resp.get("items", [])
+                for item in items:
+                    thread_snippet = item.get("snippet", {})
+                    top_comment = thread_snippet.get("topLevelComment", {}).get("snippet", {})
+                    comments.append({"video_id": vid, "video_title": titles_by_id.get(vid, ""),
+                                     "comment": top_comment.get("textDisplay", ""),
+                                     "likes": int(top_comment.get("likeCount", 0)),
+                                     "published_at": top_comment.get("publishedAt", "")})
+                    collected_for_video += 1
+                page_token = resp.get("nextPageToken")
+                if not page_token or not items or (not fetch_all_comments and collected_for_video >= max_comments):
+                    break
         except Exception:
             # Comments may be disabled or restricted for a video.
-            continue
+            pass
+        if progress_callback:
+            progress_callback(video_index, len(ids), len(comments))
+
     return pd.DataFrame(videos), pd.DataFrame(comments)
 
 def sentiment_ml(text):
     return ml_model.predict([str(text)])[0]
 
-def make_demo_data():
-    videos = pd.DataFrame([
-      {"video_id":"demo1","title":"Eid Collection | Pakistani Lawn Suit #EidCollection #Lawn","channel":"Demo Clothing PK","published_at":pd.Timestamp("2026-09-10T14:00:00Z"),"date":"2026-09-10","day":"Thursday","hour_utc":14,"views":18000,"likes":900,"comment_count":130,"hashtags":"EidCollection, Lawn","api_tags":"eid, lawn","url":"https://www.youtube.com","description":"Demo data only"},
-      {"video_id":"demo2","title":"Winter Khaddar Collection #WinterWear #PakistaniFashion","channel":"Demo Fashion","published_at":pd.Timestamp("2026-09-12T17:00:00Z"),"date":"2026-09-12","day":"Saturday","hour_utc":17,"views":24000,"likes":1200,"comment_count":180,"hashtags":"WinterWear, PakistaniFashion","api_tags":"winter, khaddar","url":"https://www.youtube.com","description":"Demo data only"},
-      {"video_id":"demo3","title":"New Embroidered Suit Designs #Embroidered #PretWear","channel":"Demo Boutique","published_at":pd.Timestamp("2026-09-14T12:00:00Z"),"date":"2026-09-14","day":"Monday","hour_utc":12,"views":9500,"likes":330,"comment_count":70,"hashtags":"Embroidered, PretWear","api_tags":"pret, embroidery","url":"https://www.youtube.com","description":"Demo data only"},
-      {"video_id":"demo4","title":"Affordable Unstitched Collection #Unstitched #SummerLawn","channel":"Demo Clothing PK","published_at":pd.Timestamp("2026-09-16T15:00:00Z"),"date":"2026-09-16","day":"Wednesday","hour_utc":15,"views":14500,"likes":700,"comment_count":95,"hashtags":"Unstitched, SummerLawn","api_tags":"summer, lawn","url":"https://www.youtube.com","description":"Demo data only"}
-    ])
-    comments = pd.DataFrame([
-      {"video_id":"demo1","video_title":"Eid Collection","comment":"Beautiful suit and lovely colors","likes":8,"published_at":""},
-      {"video_id":"demo1","video_title":"Eid Collection","comment":"Price is too high for this quality","likes":3,"published_at":""},
-      {"video_id":"demo2","video_title":"Winter Khaddar","comment":"Amazing collection, fabric looks warm","likes":10,"published_at":""},
-      {"video_id":"demo2","video_title":"Winter Khaddar","comment":"Delivery was late and disappointing","likes":2,"published_at":""},
-      {"video_id":"demo3","video_title":"Embroidered Suit","comment":"Nice design, looks good","likes":4,"published_at":""},
-      {"video_id":"demo4","video_title":"Summer Lawn","comment":"Average quality but reasonable price","likes":1,"published_at":""}
-    ])
+
+@st.cache_resource
+def load_dl_model():
+    """Load the pretrained sentiment model once per Streamlit server session."""
+    from transformers import pipeline
+    return pipeline(
+        "sentiment-analysis",
+        model="distilbert-base-uncased-finetuned-sst-2-english",
+        device=-1,  # This environment uses CPU-only PyTorch.
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_dl_predictions(texts: tuple):
+    """Cache sentiment predictions for an exact tuple of comment texts."""
+    dl = load_dl_model()
+    results = dl(
+        list(texts),
+        batch_size=4,  # A conservative starting point for CPU inference.
+        truncation=True,
+        max_length=128,
+    )
+
+    predictions = []
+    for item in results:
+        label = item["label"].upper()
+        score = item["score"]
+        if label == "POSITIVE" and score >= 0.60:
+            predictions.append("positive")
+        elif label == "NEGATIVE" and score >= 0.60:
+            predictions.append("negative")
+        else:
+            predictions.append("neutral")
+    return predictions
+
+# Persistent dataset files. Collected YouTube data is saved here and reloaded on restart.
+DATA_DIR = Path(__file__).resolve().parent / "data"
+VIDEOS_CSV = DATA_DIR / "videos.csv"
+COMMENTS_CSV = DATA_DIR / "comments.csv"
+
+VIDEO_COLUMNS = [
+    "video_id", "title", "channel", "published_at", "date", "day", "hour_utc",
+    "views", "likes", "comment_count", "hashtags", "api_tags", "url", "description"
+]
+COMMENT_COLUMNS = ["video_id", "video_title", "comment", "likes", "published_at"]
+
+
+def load_saved_data():
+    """Load the most recently collected dataset, if it exists."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    videos = pd.read_csv(VIDEOS_CSV) if VIDEOS_CSV.exists() else pd.DataFrame(columns=VIDEO_COLUMNS)
+    comments = pd.read_csv(COMMENTS_CSV) if COMMENTS_CSV.exists() else pd.DataFrame(columns=COMMENT_COLUMNS)
+
+    # Restore numeric/date types that CSV storage may otherwise infer inconsistently.
+    for column in ("views", "likes", "comment_count", "hour_utc"):
+        if column in videos:
+            videos[column] = pd.to_numeric(videos[column], errors="coerce")
+    for column in ("likes",):
+        if column in comments:
+            comments[column] = pd.to_numeric(comments[column], errors="coerce").fillna(0).astype(int)
+    if "published_at" in videos:
+        videos["published_at"] = pd.to_datetime(videos["published_at"], errors="coerce", utc=True)
     return videos, comments
 
-with st.sidebar:
-    st.header("⚙️ Data settings")
-    mode = st.radio("Choose data source", ["Demo data (works immediately)", "YouTube Data API"])
-    query = st.text_input("Search topic", "Pakistani clothing brand lawn collection")
-    max_videos = st.slider("Videos to collect", 5, 25, 10)
-    max_comments = st.slider("Comments per video", 10, 100, 30, step=10)
-    api_key_input = st.text_input("YouTube API key (optional)", type="password", help="Can also be saved as YOUTUBE_API_KEY in .env")
-    load_button = st.button("🔎 Collect / Load Data", type="primary", use_container_width=True)
 
-if "videos" not in st.session_state:
-    st.session_state.videos, st.session_state.comments = make_demo_data()
-    st.session_state.source_label = "Demo data (illustrative)"
+def save_collected_data(videos, comments):
+    """Persist raw collected YouTube records for later app runs."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    videos.to_csv(VIDEOS_CSV, index=False, encoding="utf-8-sig")
+    comments.to_csv(COMMENTS_CSV, index=False, encoding="utf-8-sig")
+
+with st.sidebar:
+    st.header("YouTube data collection")
+    st.caption("Collect real public YouTube data and save it in this project's data/ folder. Nothing is collected until you click the button.")
+    query = st.text_input("Search topic", "Pakistani clothing")
+    max_videos = st.slider(
+        "Videos to collect", 50, 1000, 100, step=50,
+        help="YouTube search results are paginated; the API may return fewer videos than requested."
+    )
+    fetch_all_comments = st.checkbox(
+        "Fetch all available top-level comments per video", value=False,
+        help="Can take a long time and consume API quota. Some videos disable comments."
+    )
+    max_comments = st.slider(
+        "Comments per video (when not fetching all)", 10, 500, 100, step=10,
+        disabled=fetch_all_comments
+    )
+    api_key_input = st.text_input(
+        "Your YouTube API key", type="password",
+        help="Use your own key, or set YOUTUBE_API_KEY in your local .env file. The app does not include a shared key."
+    )
+    load_button = st.button("Collect YouTube Data and Save", type="primary", use_container_width=True)
+
+if "videos" not in st.session_state or "comments" not in st.session_state:
+    saved_videos, saved_comments = load_saved_data()
+    st.session_state.videos = saved_videos
+    st.session_state.comments = saved_comments
+    st.session_state.source_label = "Saved YouTube dataset" if not saved_videos.empty else "No dataset loaded"
+
 if load_button:
-    if mode.startswith("Demo"):
-        st.session_state.videos, st.session_state.comments = make_demo_data()
-        st.session_state.source_label = "Demo data (illustrative)"
+    key = api_key_input.strip() or get_api_key()
+    if not key:
+        st.error("A YouTube Data API key is required. Enter your own key above or add YOUTUBE_API_KEY to your .env file. No API request was made.")
     else:
-        key = api_key_input.strip() or get_api_key()
-        if not key:
-            st.error("Enter a YouTube API key in the sidebar or add YOUTUBE_API_KEY to your .env file.")
-        else:
-            try:
-                with st.spinner("Collecting public video statistics and available comments..."):
-                    v, c = fetch_youtube(query, max_videos, max_comments, key)
-                if v.empty:
-                    st.warning("No videos were returned. Try a broader search phrase.")
-                else:
-                    st.session_state.videos, st.session_state.comments = v, c
-                    st.session_state.source_label = "Live YouTube Data API"
-                    st.success(f"Collected {len(v)} videos and {len(c)} available comments.")
-            except Exception as e:
-                st.error(f"YouTube request failed: {e}. Check API enablement, key restrictions, and quota.")
+        try:
+            with st.spinner("Collecting YouTube videos and public comments..."):
+                progress = st.progress(0, text="Searching YouTube videos...")
+
+                def update_progress(done, total, comment_count):
+                    progress.progress(
+                        min(done / max(total, 1), 1.0),
+                        text=f"Collecting comments: video {done}/{total} • {comment_count:,} comments"
+                    )
+
+                collected_videos, collected_comments = fetch_youtube(
+                    query, max_videos, max_comments, key,
+                    fetch_all_comments=fetch_all_comments,
+                    progress_callback=update_progress
+                )
+                progress.empty()
+
+            if collected_videos.empty:
+                st.warning("YouTube returned no videos. Try another search topic or check your API key and quota.")
+            else:
+                save_collected_data(collected_videos, collected_comments)
+                st.session_state.videos = collected_videos
+                st.session_state.comments = collected_comments
+                st.session_state.source_label = "Live YouTube Data API (saved in data/)"
+                # New data should not reuse the previous dataset's DL display state.
+                st.session_state.run_dl = False
+                st.session_state.sentiment_result = "ML baseline only"
+                st.success(
+                    f"Saved {len(collected_videos):,} videos and {len(collected_comments):,} comments to "
+                    f"{DATA_DIR.relative_to(Path(__file__).resolve().parent)}/videos.csv and comments.csv."
+                )
+        except Exception as e:
+            st.error(f"YouTube collection failed: {e}. Check API enablement, key restrictions, internet access, and quota.")
 
 videos = st.session_state.videos.copy()
 comments = st.session_state.comments.copy()
+
 if videos.empty:
-    st.warning("No data loaded yet.")
+    st.warning("No YouTube dataset is saved yet. Enter your own YouTube Data API key in the sidebar, choose a search topic, and click **Collect YouTube Data and Save**. The app will then analyze the saved dataset.")
+    st.info(f"Expected dataset files: `{VIDEOS_CSV}` and `{COMMENTS_CSV}`")
     st.stop()
 if not comments.empty:
+    # ML labels are lightweight and can be recreated on every run.
     comments["sentiment_ml"] = comments["comment"].apply(sentiment_ml)
-    comments["sentiment_dl"] = "Not run"
-    if "sentiment_result" not in st.session_state:
-        st.session_state.sentiment_result = "ML baseline only"
-    if st.session_state.get("run_dl", False):
+
+    # Keep previously saved DistilBERT predictions from data/comments.csv.
+    # Only mark the column as "Not run" when no valid saved predictions exist.
+    if "sentiment_dl" not in comments.columns:
+        comments["sentiment_dl"] = "Not run"
+    else:
+        comments["sentiment_dl"] = comments["sentiment_dl"].fillna("Not run").astype(str)
+
+    valid_dl_labels = {"positive", "negative", "neutral"}
+    has_saved_dl = comments["sentiment_dl"].str.lower().isin(valid_dl_labels).all()
+    if not has_saved_dl:
+        comments.loc[~comments["sentiment_dl"].str.lower().isin(valid_dl_labels), "sentiment_dl"] = "Not run"
+
+    if st.session_state.get("run_dl", False) and (not has_saved_dl or st.session_state.get("force_dl", False)):
         try:
-            from transformers import pipeline
-            @st.cache_resource
-            def load_dl_model():
-                return pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-            with st.spinner("Loading pretrained deep-learning sentiment model (first run downloads model)..."):
-                dl = load_dl_model()
-            def dl_sentiment(txt):
-                result = dl(str(txt)[:512])[0]
-                if result["label"].upper() == "POSITIVE" and result["score"] >= .60: return "positive"
-                if result["label"].upper() == "NEGATIVE" and result["score"] >= .60: return "negative"
-                return "neutral"
-            comments["sentiment_dl"] = comments["comment"].apply(dl_sentiment)
-            st.session_state.sentiment_result = "Pretrained Transformer + ML baseline"
+            texts = tuple(comments["comment"].fillna("").astype(str).tolist())
+            with st.spinner(
+                f"Loading/reusing DistilBERT and analyzing {len(texts):,} comments. "
+                "First run may take several minutes on CPU..."
+            ):
+                comments["sentiment_dl"] = cached_dl_predictions(texts)
+            # Persist model output so it appears automatically after app restart / URL reopen.
+            save_collected_data(videos, comments)
+            has_saved_dl = True
+            st.session_state.sentiment_result = "Pretrained Transformer + ML baseline (saved)"
         except Exception as e:
             st.warning(f"DL model unavailable; showing ML results. {e}")
             st.session_state.sentiment_result = "ML baseline only (DL unavailable)"
+        finally:
+            st.session_state.run_dl = False
+            st.session_state.force_dl = False
+
+    if has_saved_dl:
+        st.session_state.sentiment_result = "Pretrained Transformer + ML baseline (saved)"
+    else:
+        st.session_state.sentiment_result = "ML baseline only"
 else:
-    comments = pd.DataFrame(columns=["video_id","video_title","comment","likes","published_at","sentiment_ml","sentiment_dl"])
+    comments = pd.DataFrame(columns=[
+        "video_id", "video_title", "comment", "likes", "published_at",
+        "sentiment_ml", "sentiment_dl"
+    ])
 
 tabs = st.tabs(["📊 Overview", "🎬 Video Analysis", "💬 Sentiment NLP", "🏷️ Hashtags & Timing", "💡 Recommendations", "🤖 Data Chat", "📥 Export"])
 
 with tabs[0]:
     st.caption(f"Data source: **{st.session_state.source_label}**")
+    st.caption(f"Dataset: **{len(videos):,} saved YouTube videos** and **{len(comments):,} saved comments**.")
     a,b,c,d = st.columns(4)
     a.metric("Videos analysed", f"{len(videos):,}")
     b.metric("Total views", f"{int(videos.views.sum()):,}")
@@ -203,13 +475,23 @@ with tabs[2]:
     st.subheader("Sentiment analysis: ML + DL + NLP")
     st.write("NLP step: text is processed by TF-IDF features for the traditional ML baseline. The ML model is trained on a small built-in starter set; validate it with a labelled local dataset before making business decisions.")
     if comments.empty:
-        st.warning("No comments were returned. Use demo data or try videos with public comments enabled.")
+        st.warning("No public comments were collected for these videos. Try videos with comments enabled or collect another dataset.")
     else:
-        if st.button("Run pretrained DL sentiment model"):
-            st.session_state.run_dl = True
-            st.rerun()
-        st.caption("DL option uses a pretrained DistilBERT Transformer. First run requires internet and may take time.")
-        chosen = "sentiment_dl" if st.session_state.get("run_dl", False) and comments["sentiment_dl"].ne("Not run").any() else "sentiment_ml"
+        dl_is_saved = comments["sentiment_dl"].astype(str).str.lower().isin({"positive", "negative", "neutral"}).all()
+        if dl_is_saved:
+            st.success("Saved DistilBERT sentiment results loaded from data/comments.csv.")
+            if st.button("Re-run pretrained DL sentiment model"):
+                st.session_state.run_dl = True
+                st.session_state.force_dl = True
+                # Force a fresh inference by clearing the prediction cache.
+                cached_dl_predictions.clear()
+                st.rerun()
+        else:
+            if st.button("Run pretrained DL sentiment model"):
+                st.session_state.run_dl = True
+                st.rerun()
+        st.caption("DistilBERT results are saved in data/comments.csv after the first successful run and reused when the app is reopened.")
+        chosen = "sentiment_dl" if dl_is_saved else "sentiment_ml"
         st.write(f"Models displayed: **{st.session_state.get('sentiment_result','ML baseline only')}**")
         counts = comments[chosen].value_counts().rename_axis("sentiment").reset_index(name="comments")
         st.plotly_chart(px.bar(counts, x="sentiment", y="comments", color="sentiment", title="Sentiment distribution"), use_container_width=True)
@@ -238,22 +520,156 @@ with tabs[3]:
     st.warning("YouTube publication timestamps are UTC. Convert to Pakistan Standard Time (UTC+5) before scheduling. Observational correlations do not prove the best time to post.")
 
 with tabs[4]:
-    st.subheader("Recommended next content")
-    videos["engagement_rate"] = ((videos["likes"] + videos["comment_count"]) / videos["views"].replace(0,1) * 100).round(2)
-    best = videos.sort_values("engagement_rate", ascending=False).iloc[0]
-    st.success(f"Strongest observed engagement in this sample: **{best['title']}** ({best['engagement_rate']:.2f}% engagement proxy).")
-    st.write("**Content ideas to test**")
-    st.markdown("- Short close-up video showing fabric, stitching, and embroidery.\n- Show the price range, available sizes, and delivery details clearly.\n- Create an Eid, wedding-season, lawn, khaddar, or pret collection video that matches the brand's actual products.\n- Use a clear call to action: ask viewers which colour or design they prefer.")
-    if tag_counter:
-        st.write("**Hashtags found in this sample**")
-        st.code(" ".join(["#"+t.lstrip("#") for t,n in tag_counter.most_common(8)]))
-    st.write("**Posting-time suggestion**")
-    if not videos.dropna(subset=["hour_utc"]).empty:
-        best_hour = int(videos.groupby("hour_utc")["views"].mean().idxmax())
-        st.write(f"The sample's highest average views occurred around {best_hour:02d}:00 UTC ({(best_hour+5)%24:02d}:00 Pakistan time). Test this time against other slots; the sample may be small or affected by video age.")
-    st.write("**Ad concept template**")
-    st.text_area("Draft ad idea", "Show the new collection in a 15–25 second vertical video. Start with the strongest design, show fabric detail and price, then end with WhatsApp/order instructions.", height=100)
-    st.caption("Recommendations are practical hypotheses, not guaranteed outcomes. YouTube search results may include creators and brands from outside Pakistan.")
+    st.subheader("AI-assisted marketing recommendations")
+    st.write(
+        "Recommendations are generated from patterns in your collected YouTube videos, "
+        "engagement metrics, hashtags, publishing times, and available comment sentiment. "
+        "They are evidence-based suggestions to test, not guaranteed predictions."
+    )
+
+    if videos.empty:
+        st.info("Collect YouTube data first to generate recommendations.")
+    else:
+        videos = videos.copy()
+        videos["views"] = pd.to_numeric(videos.get("views", 0), errors="coerce").fillna(0)
+        videos["likes"] = pd.to_numeric(videos.get("likes", 0), errors="coerce").fillna(0)
+        videos["comment_count"] = pd.to_numeric(videos.get("comment_count", 0), errors="coerce").fillna(0)
+        videos["engagement_rate"] = (
+            (videos["likes"] + videos["comment_count"]) /
+            videos["views"].replace(0, 1) * 100
+        ).round(2)
+
+        top_views = videos.loc[videos["views"].idxmax()]
+        top_engagement = videos.loc[videos["engagement_rate"].idxmax()]
+        avg_views = float(videos["views"].mean()) if len(videos) else 0.0
+        avg_engagement = float(videos["engagement_rate"].mean()) if len(videos) else 0.0
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Videos in dataset", f"{len(videos):,}")
+        m2.metric("Average views", f"{avg_views:,.0f}")
+        m3.metric("Average engagement proxy", f"{avg_engagement:.2f}%")
+
+        st.markdown("### Patterns discovered in your dataset")
+        st.markdown(
+            f"- **Reach pattern:** `{top_views['title']}` has the most views "
+            f"({int(top_views['views']):,}). Review its product, title, thumbnail, and opening seconds for ideas to test."
+        )
+        st.markdown(
+            f"- **Engagement pattern:** `{top_engagement['title']}` has the highest engagement proxy "
+            f"({top_engagement['engagement_rate']:.2f}%). Compare its format and audience response with lower-engagement videos."
+        )
+
+        # Use the saved DistilBERT predictions when available; otherwise use the ML baseline.
+        sentiment_col = None
+        if not comments.empty:
+            if "sentiment_dl" in comments.columns and comments["sentiment_dl"].astype(str).str.lower().isin({"positive", "negative", "neutral"}).all():
+                sentiment_col = "sentiment_dl"
+            elif "sentiment_ml" in comments.columns:
+                sentiment_col = "sentiment_ml"
+
+        negative_share = None
+        if sentiment_col and not comments.empty:
+            sentiment_counts = comments[sentiment_col].astype(str).str.lower().value_counts()
+            total_sentiments = int(sentiment_counts.sum())
+            if total_sentiments:
+                positive_share = 100 * sentiment_counts.get("positive", 0) / total_sentiments
+                negative_share = 100 * sentiment_counts.get("negative", 0) / total_sentiments
+                neutral_share = 100 * sentiment_counts.get("neutral", 0) / total_sentiments
+                st.markdown(
+                    f"- **Audience sentiment ({sentiment_col.replace('sentiment_', '').upper()}):** "
+                    f"{positive_share:.1f}% positive, {negative_share:.1f}% negative, "
+                    f"and {neutral_share:.1f}% neutral across {total_sentiments:,} comments."
+                )
+                if negative_share >= 30:
+                    st.warning(
+                        "A relatively high share of comments is labelled negative. Read a sample of negative comments "
+                        "before changing your campaign; the current sentiment model may misclassify Urdu or Roman Urdu."
+                    )
+                elif positive_share >= 60:
+                    st.success(
+                        "Positive sentiment dominates this dataset. Test more content around the products or presentation "
+                        "that receive favourable responses, while checking the actual comments for context."
+                    )
+                else:
+                    st.info(
+                        "Sentiment is mixed. Test clearer product details, pricing, sizing, fabric close-ups, and delivery information; "
+                        "use the comments to identify which issue matters most."
+                    )
+
+        st.markdown("### Recommended marketing actions")
+        actions = []
+
+        # Hashtag patterns grounded in collected video metadata.
+        if "hashtags" in videos.columns:
+            hashtag_counter = Counter()
+            for raw_tags in videos["hashtags"].fillna(""):
+                for tag in str(raw_tags).split(","):
+                    tag = tag.strip().lstrip("#")
+                    if tag:
+                        hashtag_counter[tag] += 1
+            if hashtag_counter:
+                popular_tags = [f"#{tag}" for tag, _ in hashtag_counter.most_common(5)]
+                actions.append((
+                    "Build a relevant hashtag test",
+                    f"The most frequent hashtags in this dataset are {', '.join(popular_tags)}. Test a small, relevant set on future posts and compare results; frequency here does not prove that a hashtag caused higher views."
+                ))
+
+        # Publication time is in UTC in the collected dataset.
+        if "hour_utc" in videos.columns:
+            timed = videos.dropna(subset=["hour_utc"]).copy()
+            if not timed.empty:
+                timed["hour_utc"] = pd.to_numeric(timed["hour_utc"], errors="coerce")
+                timed = timed.dropna(subset=["hour_utc"])
+                if not timed.empty:
+                    best_hour = int(timed.groupby("hour_utc")["views"].mean().idxmax())
+                    actions.append((
+                        "Run a posting-time experiment",
+                        f"Videos posted around {best_hour:02d}:00 UTC ({(best_hour + 5) % 24:02d}:00 Pakistan time) have the highest average views in this sample. Schedule comparable posts at this time and at one or two alternative times to validate the pattern."
+                    ))
+
+        # Infer common customer concerns from negative comments using simple keyword matching.
+        if not comments.empty and "comment" in comments.columns:
+            if sentiment_col:
+                negative_comments = comments.loc[
+                    comments[sentiment_col].astype(str).str.lower().eq("negative"), "comment"
+                ].fillna("").astype(str)
+            else:
+                negative_comments = pd.Series(dtype=str)
+            concern_terms = {
+                "price or affordability": ["price", "expensive", "cost", "مہنگا", "قیمت", "mehnga"],
+                "fabric or quality": ["quality", "fabric", "material", "خراب", "کوالٹی", "kapra", "kapray"],
+                "stitching or fit": ["stitch", "stitching", "size", "fit", "سلائی", "size"],
+                "delivery or service": ["delivery", "late", "service", "shipping", "ارسال"]
+            }
+            lower_negative = negative_comments.str.lower()
+            concern_counts = {
+                concern: int(sum(lower_negative.str.contains(re.escape(term), regex=True, na=False).sum() for term in terms))
+                for concern, terms in concern_terms.items()
+            }
+            concern_counts = {k: v for k, v in concern_counts.items() if v > 0}
+            if concern_counts:
+                leading_concern, hits = max(concern_counts.items(), key=lambda item: item[1])
+                actions.append((
+                    "Address a possible customer concern",
+                    f"Keyword matching found the most mentions related to **{leading_concern}** in comments labelled negative ({hits} keyword hits, which may overlap). Consider answering this concern clearly in product videos and captions, then check a sample of comments manually."
+                ))
+
+        # Data-specific creative suggestion based on top-viewed title.
+        actions.append((
+            "Create a follow-up to the strongest-reach video",
+            f"Use `{top_views['title']}` as a reference for a new post: keep the relevant product/category theme, but create a fresh short video showing fabric texture, close-up stitching, available sizes, price range, and ordering/delivery details. Compare views and engagement with the original."
+        ))
+
+        for index, (heading, detail) in enumerate(actions, start=1):
+            with st.container(border=True):
+                st.markdown(f"**{index}. {heading}**")
+                st.write(detail)
+
+        st.caption(
+            "Method note: recommendations use descriptive patterns in the collected sample, simple keyword matching, "
+            "and the available sentiment labels. They do not establish causation. The built-in ML starter model is small, "
+            "and the English DistilBERT model may be unreliable on Urdu/Roman Urdu comments. Validate with labelled local data."
+        )
 
 with tabs[5]:
     st.subheader("Ask the dashboard")
